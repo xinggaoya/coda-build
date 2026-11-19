@@ -26,6 +26,12 @@ name: Build release
 on:
   repository_dispatch:
     types: [build-desktop]
+  # The private repository's own Actions are not available: the account's
+  # build minutes are spent elsewhere, and a job there would not start at
+  # all. The build is triggered from here instead -- either by hand, or by
+  # the watcher below, which notices a tag in the private repository.
+  schedule:
+    - cron: "*/10 * * * *"
 
 # The release is created with the workflow's own token. The source is read
 # with a separate, read-only token.
@@ -33,6 +39,47 @@ permissions:
   contents: write
 
 jobs:
+  # The private repository is tagged by `bun run deploy`; this job notices a
+  # tag that has no release here yet and asks for the build.
+  #
+  # The watcher is what makes "push the tag and the release happens" true
+  # without the private repository's own Actions: the tag is the record of
+  # the decision, and the public builder is the only place that builds.
+  watch:
+    name: Watch the private repository's tags
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Find a tag that has no release yet
+        shell: bash
+        env:
+          # The token reads the private repository's tags and dispatches the
+          # build. The workflow's own token cannot dispatch a workflow.
+          GH_TOKEN: ${{ secrets.CODA_SOURCE_TOKEN }}
+          SOURCE_REPOSITORY: xinggaoya/coda
+          BUILDER_REPOSITORY: xinggaoya/coda-build
+        run: |
+          set -euo pipefail
+          # The tags of the private repository, newest first.
+          tags="$(gh api "repos/$SOURCE_REPOSITORY/tags?per_page=20" --jq '.[].name')"
+          for tag in $tags; do
+            case "$tag" in
+              v[0-9]*) ;;
+              *) continue ;;
+            esac
+            version="${tag#v}"
+            if gh release view "v$version" --repo "$BUILDER_REPOSITORY" >/dev/null 2>&1; then
+              continue
+            fi
+            echo "==> Building $version from the tag $tag"
+            gh api --method POST "repos/$BUILDER_REPOSITORY/dispatches" \
+              -f event_type=build-desktop \
+              -f "client_payload[ref]=$tag" \
+              -f "client_payload[version]=$version"
+            exit 0
+          done
+          echo "==> Every published tag already has a release."
+
   # The CLI archives are cross-compiled: Bun emits a target binary from any
   # host, and the two sandbox runners have cross toolchains for the targets
   # they serve. The toolchain is named here because the runner image does
