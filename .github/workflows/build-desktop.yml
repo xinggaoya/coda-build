@@ -38,10 +38,13 @@ jobs:
       matrix:
         include:
           - os: linux
+            target: linux
             runner: ubuntu-latest
           - os: windows
+            target: win
             runner: windows-latest
           - os: macos
+            target: mac
             runner: macos-latest
     steps:
       - name: Checkout the private source
@@ -89,7 +92,7 @@ jobs:
       # electron-builder and gives the artifacts the names the release
       # namespace uses.
       - name: Package the desktop app
-        run: bun run package:desktop -- --target=${{ matrix.os == 'macos' && 'mac' || matrix.os }}
+        run: bun run package:desktop -- --target=${{ matrix.target }}
 
       # The staging directory holds the files this runner produced, under the
       # names the build gave them, plus the checksum manifest for them.
@@ -151,9 +154,14 @@ jobs:
       - name: Publish the platform release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The repository is named explicitly: the checkout above left the
+          # working tree pointing at the private repository, and `gh` would
+          # otherwise publish the release there.
+          RELEASE_REPOSITORY: xinggaoya/coda-build
           TAG: desktop-${{ matrix.os }}-v${{ github.event.client_payload.version }}
         run: |
           gh release create "$TAG" .artifacts/desktop/* \
+            --repo "$RELEASE_REPOSITORY" \
             --title "$TAG" \
             --notes "Desktop artifacts for Coda ${{ github.event.client_payload.version }} (${{ matrix.os }})."
           echo "==> Published $TAG"
