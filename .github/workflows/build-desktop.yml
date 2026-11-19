@@ -70,10 +70,14 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu \
-            gcc-mingw-w64-x86-64 \
-            gcc-mingw-w64-aarch64
+          # zig is one compiler that cross-compiles every target: the Linux
+          # arm64 runner and both Windows runners are built with it, so the
+          # runner carries one toolchain instead of one per architecture.
+          # The release scripts look for zig on PATH themselves.
+          if ! command -v zig >/dev/null 2>&1; then
+            sudo apt-get install -y --no-install-recommends zig || bun add --global @ziglang/cli
+          fi
+          zig version
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
