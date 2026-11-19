@@ -26,6 +26,84 @@ permissions:
   contents: write
 
 jobs:
+  # The CLI archives are cross-compiled: Bun emits a target binary from any
+  # host, and the two sandbox runners have cross toolchains for the targets
+  # they serve. The toolchains are named here because the runner image does
+  # not carry them: the Linux arm64 runner needs a matching gcc, and the
+  # Windows runners need mingw.
+  build-cli:
+    name: Build the CLI release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout the private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: xinggaoya/coda
+          ref: ${{ github.event.client_payload.ref }}
+          token: ${{ secrets.CODA_SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+
+      - name: Verify the requested version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          workspace_version="$(node -p "require('./packages/coding-agent/package.json').version")"
+          if [ "$REQUESTED_VERSION" != "$workspace_version" ]; then
+            echo "::error::The requested version ($REQUESTED_VERSION) is not the version of the source ($workspace_version)."
+            exit 1
+          fi
+          echo "==> Building the CLI release of $workspace_version"
+
+      - name: Install the cross toolchains
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            gcc-mingw-w64-x86-64 \
+            gcc-mingw-w64-aarch64
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build
+        run: bun run build
+
+      - name: Package the CLI release
+        run: bun run package:cli -- --all-platforms
+
+      # One release for the whole CLI tree: the six platform archives, the
+      # install scripts and the checksum manifest.
+      - name: Publish the CLI release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPOSITORY: xinggaoya/coda-build
+          VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          source_dir=".artifacts/remote-server/$VERSION"
+          if [ ! -f "$source_dir/SHA256SUMS" ]; then
+            echo "::error::package:cli produced no release tree under $source_dir."
+            exit 1
+          fi
+          gh release create "cli-v$VERSION" "$source_dir"/* \
+            --repo "$RELEASE_REPOSITORY" \
+            --title "cli-v$VERSION" \
+            --notes "CLI release archives for Coda $VERSION."
+          echo "==> Published cli-v$VERSION"
+
   build:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.runner }}
