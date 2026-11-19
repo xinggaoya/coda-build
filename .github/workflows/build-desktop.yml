@@ -1,10 +1,11 @@
-name: Build desktop
+name: Build release
 
 # This repository holds a build, not a source tree. The source lives in the
 # private repository; this repository exists because a public repository
-# builds on GitHub-hosted runners for free, and the private repository's
-# build minutes are a scarce resource that should not be spent on the
-# desktop artifacts.
+# builds on GitHub-hosted runners for free, while a private repository
+# spends a small monthly pool of build minutes. The desktop artifacts are
+# the expensive part -- a macOS artifact can only be built on macOS -- so
+# they are built here, on runners that cost the private repository nothing.
 #
 # The workflow is triggered by a `repository_dispatch` from the private
 # repository. That is the only trigger: the payload carries the ref to
@@ -15,22 +16,28 @@ name: Build desktop
 # publishes is a binary, never a source line. The credentials that can write
 # to the release host do not live here -- the artifacts travel back to the
 # private repository, which publishes them.
+#
+# One version is one release. Every builder uploads its part as a workflow
+# artifact, and the publish job merges the parts into a single release
+# named after the version. A mirror that serves one directory per version
+# needs exactly that shape, and the release assets are the download source
+# the relay proxies.
 
 on:
   repository_dispatch:
     types: [build-desktop]
 
-# The tag and the release are created with the workflow's own token. The
-# source is read with a separate, read-only token.
+# The release is created with the workflow's own token. The source is read
+# with a separate, read-only token.
 permissions:
   contents: write
 
 jobs:
   # The CLI archives are cross-compiled: Bun emits a target binary from any
   # host, and the two sandbox runners have cross toolchains for the targets
-  # they serve. The toolchains are named here because the runner image does
-  # not carry them: the Linux arm64 runner needs a matching gcc, and the
-  # Windows runners need mingw.
+  # they serve. The toolchain is named here because the runner image does
+  # not carry it: zig cross-compiles every target, so one compiler covers
+  # the Linux arm64 runner and both Windows runners.
   build-cli:
     name: Build the CLI release
     runs-on: ubuntu-latest
@@ -70,10 +77,6 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          # zig is one compiler that cross-compiles every target: the Linux
-          # arm64 runner and both Windows runners are built with it, so the
-          # runner carries one toolchain instead of one per architecture.
-          # The release scripts look for zig on PATH themselves.
           if ! command -v zig >/dev/null 2>&1; then
             sudo apt-get install -y --no-install-recommends zig || bun add --global @ziglang/cli
           fi
@@ -88,28 +91,18 @@ jobs:
       - name: Package the CLI release
         run: bun run package:cli -- --all-platforms
 
-      # One release for the whole CLI tree: the six platform archives, the
-      # install scripts and the checksum manifest.
-      - name: Publish the CLI release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_REPOSITORY: xinggaoya/coda-build
-          VERSION: ${{ github.event.client_payload.version }}
-        run: |
-          source_dir=".artifacts/remote-server/$VERSION"
-          if [ ! -f "$source_dir/SHA256SUMS" ]; then
-            echo "::error::package:cli produced no release tree under $source_dir."
-            exit 1
-          fi
-          gh release create "cli-v$VERSION" "$source_dir"/* \
-            --repo "$RELEASE_REPOSITORY" \
-            --title "cli-v$VERSION" \
-            --notes "CLI release archives for Coda $VERSION."
-          echo "==> Published cli-v$VERSION"
+      # The part of the release this runner produced: the six platform
+      # archives, the install scripts and the checksum manifest.
+      - name: Upload the CLI part
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cli
+          path: .artifacts/remote-server/${{ github.event.client_payload.version }}
+          if-no-files-found: error
+          retention-days: 7
 
-  build:
-    name: ${{ matrix.os }}
+  build-desktop:
+    name: Build the desktop release (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -147,10 +140,6 @@ jobs:
         with:
           bun-version: 1.4.4
 
-      # The release name the artifacts are published under comes from the
-      # dispatcher. It is checked against the source before anything is
-      # built: a release published under a version the source does not
-      # carry is a release nobody can install.
       - name: Verify the requested version
         shell: bash
         env:
@@ -211,7 +200,7 @@ jobs:
       # The manifest of the artifacts this runner produced. The publisher
       # verifies every file against the merged manifest before it uploads
       # anything, so an artifact that was corrupted on the way here never
-      # reaches the host.
+      # reaches a user.
       - name: Write the desktop checksum manifest
         shell: bash
         run: |
@@ -229,22 +218,75 @@ jobs:
             done > SHA256SUMS
           )
 
-      # One release per platform: the private repository downloads each of
-      # them into its own directory, and the merge step that puts the
-      # desktop artifacts next to the CLI archives expects exactly that
-      # shape -- one directory per platform, each with its own manifest.
-      - name: Publish the platform release
+      - name: Upload the desktop part
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: desktop-${{ matrix.os }}
+          path: .artifacts/desktop
+          if-no-files-found: error
+          retention-days: 7
+
+  # One version is one release. The parts arrive as workflow artifacts and
+  # are merged here: the release tree the mirror serves is a directory per
+  # version, and its checksum manifest covers every file in it.
+  publish:
+    name: Publish the release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [build-cli, build-desktop]
+    steps:
+      # The merge script is the private repository's: it is the one that
+      # knows what a release tree is, and duplicating it here would let the
+      # two drift apart.
+      - name: Checkout the private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: xinggaoya/coda
+          ref: ${{ github.event.client_payload.ref }}
+          token: ${{ secrets.CODA_SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Download the CLI part
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: cli
+          path: .artifacts/parts/cli
+
+      - name: Download the desktop parts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: desktop-*
+          path: .artifacts/parts/desktop
+
+      # The merge refuses a tree it cannot vouch for: a file nobody listed,
+      # a file that does not match its checksum, a file two parts produced
+      # with different checksums.
+      - name: Merge the release tree
+        shell: bash
+        env:
+          VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          node scripts/assemble-release-tree.mjs \
+            --cli=.artifacts/parts/cli \
+            --desktop=.artifacts/parts/desktop \
+            --version="$VERSION" \
+            --output=.artifacts/release
+
+      - name: Publish the release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # The repository is named explicitly: the checkout above left the
-          # working tree pointing at the private repository, and `gh` would
-          # otherwise publish the release there.
           RELEASE_REPOSITORY: xinggaoya/coda-build
-          TAG: desktop-${{ matrix.os }}-v${{ github.event.client_payload.version }}
+          VERSION: ${{ github.event.client_payload.version }}
         run: |
-          gh release create "$TAG" .artifacts/desktop/* \
+          tree=".artifacts/release/$VERSION"
+          gh release create "v$VERSION" "$tree"/* \
             --repo "$RELEASE_REPOSITORY" \
-            --title "$TAG" \
-            --notes "Desktop artifacts for Coda ${{ github.event.client_payload.version }} (${{ matrix.os }})."
-          echo "==> Published $TAG"
+            --title "Coda $VERSION" \
+            --notes "Coda $VERSION: the CLI archives, the install scripts and the desktop artifacts."
+          echo "==> Published v$VERSION"
