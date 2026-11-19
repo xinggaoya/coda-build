@@ -62,6 +62,22 @@ jobs:
         with:
           bun-version: 1.4.4
 
+      # The release name the artifacts are published under comes from the
+      # dispatcher. It is checked against the source before anything is
+      # built: a release published under a version the source does not
+      # carry is a release nobody can install.
+      - name: Verify the requested version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          workspace_version="$(node -p "require('./packages/coding-agent/package.json').version")"
+          if [ "$REQUESTED_VERSION" != "$workspace_version" ]; then
+            echo "::error::The requested version ($REQUESTED_VERSION) is not the version of the source ($workspace_version)."
+            exit 1
+          fi
+          echo "==> Building the desktop artifacts of $workspace_version"
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
