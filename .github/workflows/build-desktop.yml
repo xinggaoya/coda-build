@@ -1,0 +1,143 @@
+name: Build desktop
+
+# This repository holds a build, not a source tree. The source lives in the
+# private repository; this repository exists because a public repository
+# builds on GitHub-hosted runners for free, and the private repository's
+# build minutes are a scarce resource that should not be spent on the
+# desktop artifacts.
+#
+# The workflow is triggered by a `repository_dispatch` from the private
+# repository. That is the only trigger: the payload carries the ref to
+# build, and there is no way to type a ref into this workflow, so nobody
+# outside the private repository can make it build anything.
+#
+# The source is checked out with a read-only token, so what this repository
+# publishes is a binary, never a source line. The credentials that can write
+# to the release host do not live here -- the artifacts travel back to the
+# private repository, which publishes them.
+
+on:
+  repository_dispatch:
+    types: [build-desktop]
+
+# The tag and the release are created with the workflow's own token. The
+# source is read with a separate, read-only token.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      # One platform failing must not throw away the artifact the other
+      # platforms already built: the release is published with what is
+      # there, and the failure is visible in the job that failed.
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-latest
+          - os: windows
+            runner: windows-latest
+          - os: macos
+            runner: macos-latest
+    steps:
+      - name: Checkout the private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: xinggaoya/coda
+          ref: ${{ github.event.client_payload.ref }}
+          token: ${{ secrets.CODA_SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build
+        run: bun run build
+
+      # The desktop app is Electron: a macOS artifact can only be built on
+      # macOS and a Windows artifact only on Windows. `package:desktop` runs
+      # electron-builder and gives the artifacts the names the release
+      # namespace uses.
+      - name: Package the desktop app
+        run: bun run package:desktop -- --target=${{ matrix.os == 'macos' && 'mac' || matrix.os }}
+
+      # The staging directory holds the files this runner produced, under the
+      # names the build gave them, plus the checksum manifest for them.
+      #
+      # What is filtered here is the file *format*, not the name: the release
+      # namespace carries a desktop artifact as an AppImage, a zip or an exe.
+      # electron-builder's own sidecars -- the update manifests, the
+      # blockmaps, the disk image -- are not release artifacts, and the
+      # install script never asks for them.
+      - name: Stage the desktop artifacts
+        shell: bash
+        run: |
+          mkdir -p .artifacts/desktop
+          staged=0
+          for file in apps/desktop/out/*; do
+            if [ ! -f "$file" ]; then
+              continue
+            fi
+            case "$file" in
+              *.AppImage | *.zip | *.exe)
+                cp "$file" .artifacts/desktop/
+                staged=$((staged + 1))
+                ;;
+            esac
+          done
+          if [ "$staged" -eq 0 ]; then
+            echo "::error::package:desktop produced no release artifact under apps/desktop/out."
+            echo "The artifact names are decided by scripts/build-desktop.mjs; check that it still produces them."
+            exit 1
+          fi
+          echo "==> Staged $staged desktop artifact(s):"
+          ls -1 .artifacts/desktop
+
+      # The manifest of the artifacts this runner produced. The publisher
+      # verifies every file against the merged manifest before it uploads
+      # anything, so an artifact that was corrupted on the way here never
+      # reaches the host.
+      - name: Write the desktop checksum manifest
+        shell: bash
+        run: |
+          (
+            cd .artifacts/desktop
+            for file in *; do
+              if [ ! -f "$file" ] || [ "$file" = "SHA256SUMS" ]; then
+                continue
+              fi
+              if command -v sha256sum >/dev/null 2>&1; then
+                sha256sum "$file"
+              else
+                shasum -a 256 "$file"
+              fi
+            done > SHA256SUMS
+          )
+
+      # One release per platform: the private repository downloads each of
+      # them into its own directory, and the merge step that puts the
+      # desktop artifacts next to the CLI archives expects exactly that
+      # shape -- one directory per platform, each with its own manifest.
+      - name: Publish the platform release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: desktop-${{ matrix.os }}-v${{ github.event.client_payload.version }}
+        run: |
+          gh release create "$TAG" .artifacts/desktop/* \
+            --title "$TAG" \
+            --notes "Desktop artifacts for Coda ${{ github.event.client_payload.version }} (${{ matrix.os }})."
+          echo "==> Published $TAG"
