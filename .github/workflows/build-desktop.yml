@@ -173,10 +173,12 @@ jobs:
       # names the build gave them, plus the checksum manifest for them.
       #
       # What is filtered here is the file *format*, not the name: the release
-      # namespace carries a desktop artifact as an AppImage, a zip or an exe.
-      # electron-builder's own sidecars -- the update manifests, the
-      # blockmaps, the disk image -- are not release artifacts, and the
-      # install script never asks for them.
+      # namespace carries a desktop artifact as an AppImage, a disk image, a
+      # zip or an exe. The disk image is macOS's install form -- it mounts
+      # into a window the user drags the app out of -- so it is a release
+      # artifact, not one of electron-builder's sidecars. What is still
+      # filtered out are the update manifests and the blockmaps: the install
+      # script never asks for them.
       - name: Stage the desktop artifacts
         shell: bash
         run: |
@@ -187,7 +189,7 @@ jobs:
               continue
             fi
             case "$file" in
-              *.AppImage | *.zip | *.exe)
+              *.AppImage | *.dmg | *.zip | *.exe)
                 cp "$file" .artifacts/desktop/
                 staged=$((staged + 1))
                 ;;
