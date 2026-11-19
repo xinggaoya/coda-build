@@ -152,6 +152,7 @@ jobs:
       # desktop artifacts next to the CLI archives expects exactly that
       # shape -- one directory per platform, each with its own manifest.
       - name: Publish the platform release
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # The repository is named explicitly: the checkout above left the
