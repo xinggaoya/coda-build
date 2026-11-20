@@ -47,6 +47,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
+      # The full history, and the tags with it.
+      #
+      # The release notes are generated from the commits between two version
+      # tags (scripts/release-notes.mjs), so this checkout needs the tags and
+      # the commits they point at. A shallow checkout has neither, and
+      # `persist-credentials: false` means the token is not left behind for a
+      # `git fetch` to use -- so without this the release ships without any
+      # notes at all.
       - name: Checkout the private source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -54,6 +62,7 @@ jobs:
           ref: ${{ github.event.client_payload.ref }}
           token: ${{ secrets.CODA_SOURCE_TOKEN }}
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -291,8 +300,16 @@ jobs:
           VERSION: ${{ github.event.client_payload.version }}
         run: |
           tree=".artifacts/release/$VERSION"
+          # The release notes are part of the tree, so the release page can
+          # carry them as its body: the page then says what changed in this
+          # version instead of a fixed sentence about the archives. A release
+          # built before the notes existed keeps the fixed sentence.
+          notes_args=(--notes "Coda $VERSION: the CLI archives, the install scripts and the desktop artifacts.")
+          if [ -f "$tree/release-notes.md" ]; then
+            notes_args=(--notes-file "$tree/release-notes.md")
+          fi
           gh release create "v$VERSION" "$tree"/* \
             --repo "$RELEASE_REPOSITORY" \
             --title "Coda $VERSION" \
-            --notes "Coda $VERSION: the CLI archives, the install scripts and the desktop artifacts."
+            "${notes_args[@]}"
           echo "==> Published v$VERSION"
