@@ -241,6 +241,77 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # The Relay is published as a Release asset next to the installers, so a
+  # machine can fetch one binary and run it -- no runtime, no container, no
+  # package manager. That is why it is built against musl: a static binary
+  # runs on any Linux of the same architecture, whatever libc it has.
+  build-relay:
+    name: Build the relay binary (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            name: coda-relay-linux-x64
+          - target: aarch64-unknown-linux-musl
+            name: coda-relay-linux-arm64
+    steps:
+      - name: Checkout the private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: xinggaoya/coda
+          ref: ${{ github.event.client_payload.ref }}
+          token: ${{ secrets.CODA_SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      # The toolchain is pinned by the source tree itself
+      # (crates/relay/rust-toolchain.toml), so the pin lives in exactly one
+      # place. rustup honours that file on its own -- what it does not do is
+      # add the musl target the static build needs, so that is done here.
+      - name: Setup Rust
+        shell: bash
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' crates/relay/rust-toolchain.toml)"
+          if [ -z "$channel" ]; then
+            echo "::error::crates/relay/rust-toolchain.toml pins no channel."
+            exit 1
+          fi
+          rustup toolchain install "$channel"
+          rustup target add --toolchain "$channel" "${{ matrix.target }}"
+          rustup run "$channel" cargo --version
+
+      - name: Build the relay binary
+        run: node scripts/build-relay-binary.mjs --target ${{ matrix.target }}
+
+      # The staging directory holds the binary under the name the release
+      # namespace uses, plus the checksum manifest for it: the release tree
+      # refuses to carry a file nobody can verify.
+      - name: Stage the relay binary
+        shell: bash
+        run: |
+          mkdir -p .artifacts/relay
+          cp "crates/relay/dist/coda-relay-${{ matrix.target }}" ".artifacts/relay/${{ matrix.name }}"
+          (
+            cd .artifacts/relay
+            sha256sum "${{ matrix.name }}" > SHA256SUMS
+          )
+          ls -1 .artifacts/relay
+
+      - name: Upload the relay part
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: relay-${{ matrix.target }}
+          path: .artifacts/relay
+          if-no-files-found: error
+          retention-days: 7
+
   # One version is one release. The parts arrive as workflow artifacts and
   # are merged here: the release tree the mirror serves is a directory per
   # version, and its checksum manifest covers every file in it.
@@ -248,7 +319,7 @@ jobs:
     name: Publish the release
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [build-cli, build-desktop]
+    needs: [build-cli, build-desktop, build-relay]
     steps:
       # The merge script is the private repository's: it is the one that
       # knows what a release tree is, and duplicating it here would let the
@@ -278,6 +349,12 @@ jobs:
           pattern: desktop-*
           path: .artifacts/parts/desktop
 
+      - name: Download the relay parts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: relay-*
+          path: .artifacts/parts/relay
+
       # The merge refuses a tree it cannot vouch for: a file nobody listed,
       # a file that does not match its checksum, a file two parts produced
       # with different checksums.
@@ -286,9 +363,22 @@ jobs:
         env:
           VERSION: ${{ github.event.client_payload.version }}
         run: |
+          # The relay parts are merged into one directory: the tree carries
+          # one checksum manifest for everything it holds.
+          mkdir -p .artifacts/parts/relay
+          for part in .artifacts/parts/relay/*/; do
+            cp "$part"* .artifacts/parts/relay/ 2>/dev/null || true
+          done
+          rm -f .artifacts/parts/relay/SHA256SUMS
+          (
+            cd .artifacts/parts/relay
+            sha256sum coda-relay-* > SHA256SUMS
+          )
+
           node scripts/assemble-release-tree.mjs \
             --cli=.artifacts/parts/cli \
             --desktop=.artifacts/parts/desktop \
+            --relay=.artifacts/parts/relay \
             --version="$VERSION" \
             --output=.artifacts/release
 
