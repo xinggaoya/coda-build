@@ -417,13 +417,15 @@ jobs:
       - name: Deploy the relay
         shell: bash
         env:
-          CODA_RELAY_SSH_KEY: ~/.ssh/id_ed25519
           CODA_RELAY_HOST: ${{ vars.CODA_RELAY_HOST }}
           CODA_RELAY_USER: ${{ vars.CODA_RELAY_USER }}
           CODA_RELAY_SSH_PORT: ${{ vars.CODA_RELAY_SSH_PORT }}
           CODA_RELAY_REMOTE_ROOT: ${{ vars.CODA_RELAY_REMOTE_ROOT }}
           CODA_RELAY_PUBLIC_URL: ${{ vars.CODA_RELAY_PUBLIC_URL }}
         run: |
+          # The key path is exported here rather than in the env block: a
+          # `~` in an environment variable is not expanded.
+          export CODA_RELAY_SSH_KEY="$HOME/.ssh/id_ed25519"
           # The release path knows the version; a manual run takes it from
           # the checkout it just built.
           args=(--binary .artifacts/relay/coda-relay-linux-x64)
