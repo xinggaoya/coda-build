@@ -320,16 +320,24 @@ jobs:
         shell: bash
         run: |
           binary="crates/relay/dist/coda-relay-x86_64-unknown-linux-musl"
-          if command -v file >/dev/null 2>&1; then
-            file "$binary"
-          fi
-          if ldd "$binary" 2>&1 | grep -q "not a dynamic executable"; then
-            echo "==> The binary is static."
-          else
-            echo "::error::The relay binary is not static; it would not run on a bare Linux."
-            ldd "$binary" || true
-            exit 1
-          fi
+          description="$(file -b "$binary" 2>/dev/null || true)"
+          echo "$description"
+          # A musl build is a position-independent static executable, so
+          # `file` says "static-pie linked" and `ldd` says "statically
+          # linked" -- not the "not a dynamic executable" a non-PIE static
+          # binary gets. Both are static; both are what we want.
+          case "$description" in
+            *static*) echo "==> The binary is static." ;;
+            *)
+              if ldd "$binary" 2>&1 | grep -qE "not a dynamic executable|statically linked"; then
+                echo "==> The binary is static."
+              else
+                echo "::error::The relay binary is not static; it would not run on a bare Linux."
+                ldd "$binary" || true
+                exit 1
+              fi
+              ;;
+          esac
 
       # The staging directory holds the binary under the name the release
       # namespace uses, plus the checksum manifest for it: the release tree
