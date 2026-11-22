@@ -30,6 +30,15 @@ name: Build release
 on:
   repository_dispatch:
     types: [build-desktop]
+  # The manual trigger builds the relay binary alone. It is how the musl
+  # build gets verified without cutting a release for it: the release path
+  # must not depend on a workflow that only runs on a release.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "The ref to build the relay binary from"
+        required: false
+        default: ""
 
 # The release is created with the workflow's own token. The source is read
 # with a separate, read-only token.
@@ -245,24 +254,20 @@ jobs:
   # machine can fetch one binary and run it -- no runtime, no container, no
   # package manager. That is why it is built against musl: a static binary
   # runs on any Linux of the same architecture, whatever libc it has.
+  #
+  # Only x86-64 is built here. An arm64 static build needs a cross C
+  # toolchain, and a half-crossed artifact is worse than none: somebody
+  # would run it and find out. An arm64 self-hoster builds from the source.
   build-relay:
-    name: Build the relay binary (${{ matrix.target }})
+    name: Build the relay binary
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            name: coda-relay-linux-x64
-          - target: aarch64-unknown-linux-musl
-            name: coda-relay-linux-arm64
     steps:
       - name: Checkout the private source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: xinggaoya/coda
-          ref: ${{ github.event.client_payload.ref }}
+          ref: ${{ github.event.client_payload.ref || inputs.ref || github.ref }}
           token: ${{ secrets.CODA_SOURCE_TOKEN }}
           persist-credentials: false
 
@@ -284,11 +289,43 @@ jobs:
             exit 1
           fi
           rustup toolchain install "$channel"
-          rustup target add --toolchain "$channel" "${{ matrix.target }}"
+          rustup target add --toolchain "$channel" x86_64-unknown-linux-musl
           rustup run "$channel" cargo --version
 
+      # The TLS stack is C code, so a static build needs a C compiler that
+      # targets musl as well. The distribution's `musl-tools` is it.
+      - name: Install the musl C toolchain
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          musl-gcc --version | head -1
+
       - name: Build the relay binary
-        run: node scripts/build-relay-binary.mjs --target ${{ matrix.target }}
+        shell: bash
+        env:
+          # The C code has to be compiled against musl, not against the
+          # runner's glibc: the objects are linked into a static binary.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          AR_x86_64_unknown_linux_musl: ar
+        run: node scripts/build-relay-binary.mjs --target x86_64-unknown-linux-musl
+
+      # The static binary is the point: it has to run on a Linux that has
+      # no libc to speak of.
+      - name: Check that the binary is static
+        shell: bash
+        run: |
+          binary="crates/relay/dist/coda-relay-x86_64-unknown-linux-musl"
+          if command -v file >/dev/null 2>&1; then
+            file "$binary"
+          fi
+          if ldd "$binary" 2>&1 | grep -q "not a dynamic executable"; then
+            echo "==> The binary is static."
+          else
+            echo "::error::The relay binary is not static; it would not run on a bare Linux."
+            ldd "$binary" || true
+            exit 1
+          fi
 
       # The staging directory holds the binary under the name the release
       # namespace uses, plus the checksum manifest for it: the release tree
@@ -297,17 +334,17 @@ jobs:
         shell: bash
         run: |
           mkdir -p .artifacts/relay
-          cp "crates/relay/dist/coda-relay-${{ matrix.target }}" ".artifacts/relay/${{ matrix.name }}"
+          cp crates/relay/dist/coda-relay-x86_64-unknown-linux-musl .artifacts/relay/coda-relay-linux-x64
           (
             cd .artifacts/relay
-            sha256sum "${{ matrix.name }}" > SHA256SUMS
+            sha256sum coda-relay-linux-x64 > SHA256SUMS
           )
           ls -1 .artifacts/relay
 
       - name: Upload the relay part
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: relay-${{ matrix.target }}
+          name: relay
           path: .artifacts/relay
           if-no-files-found: error
           retention-days: 7
@@ -319,7 +356,10 @@ jobs:
     name: Publish the release
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [build-cli, build-desktop, build-relay]
+    needs: [build-cli, build-desktop]
+    # The manual trigger builds the relay binary alone; there is no release
+    # to publish in that case.
+    if: github.event_name == 'repository_dispatch' 
     steps:
       # The merge script is the private repository's: it is the one that
       # knows what a release tree is, and duplicating it here would let the
@@ -349,10 +389,14 @@ jobs:
           pattern: desktop-*
           path: .artifacts/parts/desktop
 
-      - name: Download the relay parts
+      # The relay binary is a convenience for people who run their own
+      # relay, not the release itself: a failed relay build must not stop
+      # the release from being published.
+      - name: Download the relay part
+        continue-on-error: true
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: relay-*
+          name: relay
           path: .artifacts/parts/relay
 
       # The merge refuses a tree it cannot vouch for: a file nobody listed,
@@ -363,22 +407,21 @@ jobs:
         env:
           VERSION: ${{ github.event.client_payload.version }}
         run: |
-          # The relay parts are merged into one directory: the tree carries
-          # one checksum manifest for everything it holds.
-          mkdir -p .artifacts/parts/relay
-          for part in .artifacts/parts/relay/*/; do
-            cp "$part"* .artifacts/parts/relay/ 2>/dev/null || true
-          done
-          rm -f .artifacts/parts/relay/SHA256SUMS
-          (
-            cd .artifacts/parts/relay
-            sha256sum coda-relay-* > SHA256SUMS
-          )
+          # The relay binaries go into the same tree, and the tree's one
+          # checksum manifest covers them: a file nobody can verify is a
+          # file nobody should run.
+          relay_args=()
+          if [ -f .artifacts/parts/relay/coda-relay-linux-x64 ]; then
+            relay_args=(--relay=.artifacts/parts/relay)
+            echo "==> The release carries the relay binary."
+          else
+            echo "::warning::This release carries no relay binary; the relay build did not produce one."
+          fi
 
           node scripts/assemble-release-tree.mjs \
             --cli=.artifacts/parts/cli \
             --desktop=.artifacts/parts/desktop \
-            --relay=.artifacts/parts/relay \
+            "${relay_args[@]}" \
             --version="$VERSION" \
             --output=.artifacts/release
 
