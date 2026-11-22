@@ -55,6 +55,8 @@ jobs:
     name: Build the CLI release
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # The manual trigger builds the relay binary alone.
+    if: github.event_name == 'repository_dispatch'
     steps:
       # The full history, and the tags with it.
       #
@@ -127,6 +129,8 @@ jobs:
     name: Build the desktop release (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    # The manual trigger builds the relay binary alone.
+    if: github.event_name == 'repository_dispatch'
     strategy:
       # One platform failing must not throw away the artifact the other
       # platforms already built: the release is published with what is
@@ -267,7 +271,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: xinggaoya/coda
-          ref: ${{ github.event.client_payload.ref || inputs.ref || github.ref }}
+          ref: ${{ github.event.client_payload.ref || inputs.ref || 'main' }}
           token: ${{ secrets.CODA_SOURCE_TOKEN }}
           persist-credentials: false
 
@@ -348,6 +352,69 @@ jobs:
           path: .artifacts/relay
           if-no-files-found: error
           retention-days: 7
+
+  # The Relay is a service on the release host, and the host runs the binary
+  # the release published -- not a second build of it. The pipeline holds the
+  # credentials for the host and the binary it just built, so the server is
+  # updated without anybody having to be logged in anywhere.
+  #
+  # It waits for the **binary**, not for the release: the desktop build takes
+  # minutes, and the relay should not wait for it. A relay fix goes out as
+  # soon as the binary exists.
+  deploy-relay:
+    name: Deploy the relay to the release host
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [build-relay]
+    # The manual trigger builds the relay binary alone: it verifies the
+    # build, it does not put anything on the host.
+    if: github.event_name == 'repository_dispatch' 
+    steps:
+      - name: Checkout the private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: xinggaoya/coda
+          ref: ${{ github.event.client_payload.ref }}
+          token: ${{ secrets.CODA_SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Download the relay binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: relay
+          path: .artifacts/relay
+
+      # The key is the deployment's credential. A password would work too,
+      # but a key can be revoked, and it cannot be typed at the wrong
+      # moment.
+      - name: Write the deployment key
+        shell: bash
+        env:
+          DEPLOY_KEY: ${{ secrets.CODA_RELAY_DEPLOY_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keygen -y -f ~/.ssh/id_ed25519 > ~/.ssh/id_ed25519.pub
+
+      - name: Deploy the relay
+        shell: bash
+        env:
+          CODA_RELAY_SSH_KEY: ~/.ssh/id_ed25519
+          CODA_RELAY_HOST: ${{ vars.CODA_RELAY_HOST }}
+          CODA_RELAY_USER: ${{ vars.CODA_RELAY_USER }}
+          CODA_RELAY_SSH_PORT: ${{ vars.CODA_RELAY_SSH_PORT }}
+          CODA_RELAY_REMOTE_ROOT: ${{ vars.CODA_RELAY_REMOTE_ROOT }}
+          CODA_RELAY_PUBLIC_URL: ${{ vars.CODA_RELAY_PUBLIC_URL }}
+        run: |
+          bash scripts/deploy-coda-relay.sh \
+            --binary .artifacts/relay/coda-relay-linux-x64 \
+            --version "${{ github.event.client_payload.version }}"
 
   # One version is one release. The parts arrive as workflow artifacts and
   # are merged here: the release tree the mirror serves is a directory per
