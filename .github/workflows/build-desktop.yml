@@ -36,9 +36,13 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "The ref to build the relay binary from"
+        description: "The ref to build the relay binary from (in the source repository)"
         required: false
         default: ""
+      deploy:
+        description: "Also deploy the relay to the release host"
+        type: boolean
+        default: false
 
 # The release is created with the workflow's own token. The source is read
 # with a separate, read-only token.
@@ -374,15 +378,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [build-relay]
-    # The manual trigger builds the relay binary alone: it verifies the
-    # build, it does not put anything on the host.
-    if: github.event_name == 'repository_dispatch' 
+    # The manual trigger builds the relay binary alone; deploying it is an
+    # explicit choice, not the default of a verification run.
+    if: github.event_name == 'repository_dispatch' || inputs.deploy == true
     steps:
       - name: Checkout the private source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: xinggaoya/coda
-          ref: ${{ github.event.client_payload.ref }}
+          ref: ${{ github.event.client_payload.ref || inputs.ref || 'main' }}
           token: ${{ secrets.CODA_SOURCE_TOKEN }}
           persist-credentials: false
 
@@ -420,9 +424,14 @@ jobs:
           CODA_RELAY_REMOTE_ROOT: ${{ vars.CODA_RELAY_REMOTE_ROOT }}
           CODA_RELAY_PUBLIC_URL: ${{ vars.CODA_RELAY_PUBLIC_URL }}
         run: |
-          bash scripts/deploy-coda-relay.sh \
-            --binary .artifacts/relay/coda-relay-linux-x64 \
-            --version "${{ github.event.client_payload.version }}"
+          # The release path knows the version; a manual run takes it from
+          # the checkout it just built.
+          args=(--binary .artifacts/relay/coda-relay-linux-x64)
+          version="${{ github.event.client_payload.version }}"
+          if [ -n "$version" ]; then
+            args+=(--version "$version")
+          fi
+          bash scripts/deploy-coda-relay.sh "${args[@]}"
 
   # One version is one release. The parts arrive as workflow artifacts and
   # are merged here: the release tree the mirror serves is a directory per
